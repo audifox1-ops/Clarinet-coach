@@ -11,13 +11,11 @@
  */
 
 import { useState, useRef, useEffect, useCallback } from "react";
+import { GoogleGenAI } from "@google/genai";
 
 // ────────────────────────────────────────────────────────────────────────────────
 // 상수 및 설정
 // ────────────────────────────────────────────────────────────────────────────────
-
-/** Google Gemini API 엔드포인트 */
-const GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models";
 
 /** 앱 화면 목록 */
 const SCREENS = {
@@ -129,25 +127,25 @@ const fileToBase64 = (file) =>
 // ────────────────────────────────────────────────────────────────────────────────
 
 /**
- * Google Gemini API로 클라리넷 연주를 분석한다
+ * Google GenAI SDK(@google/genai)로 클라리넷 연주를 분석한다
  *
- * 비디오 처리 전략:
- *  1) 비디오 → Gemini File API로 먼저 업로드 → URI 참조로 분석 요청
- *  2) 이미지 → inline base64로 직접 전송
- *  3) 파일 없음 → 텍스트 프롬프트만 전송
- *
- * 400 오류 방지: 비디오 inline_data 직접 전송 대신 File API URI 사용
+ * 비디오: SDK의 ai.files.upload() → URI 참조로 generateContent
+ * 이미지: inline base64로 직접 전송
+ * SDK 사용으로 File API 헤더/포맷 문제 완전 해소
  */
 const analyzePerformance = async (videoFile, age, gender, apiKey) => {
   const personaPrompt = buildPersonaPrompt(age, gender);
   const isVideo = videoFile.type.startsWith("video/");
   const isImage = videoFile.type.startsWith("image/");
 
+  // Google GenAI SDK 초기화
+  const ai = new GoogleGenAI({ apiKey });
+
   // JSON 응답 스키마
   const jsonSchema = `{
   "detectedSong": "감지된 곡명 (모르면 '곡명 미상')",
-  "scores": { "intonation": 0-100, "rhythm": 0-100, "tone": 0-100, "dynamics": 0-100 },
-  "overall": 0-100,
+  "scores": { "intonation": 0~100숫자, "rhythm": 0~100숫자, "tone": 0~100숫자, "dynamics": 0~100숫자 },
+  "overall": 0~100숫자,
   "praise": "잘한 점 2-3문장",
   "improvements": ["개선점1", "개선점2", "개선점3"],
   "coachComment": "선생님 스타일의 따뜻하고 전문적인 총평 3-4문장",
@@ -157,76 +155,58 @@ const analyzePerformance = async (videoFile, age, gender, apiKey) => {
 
   const basePrompt = `${personaPrompt}\n\n반드시 아래 JSON 형식으로만 응답하세요 (코드블록 없이 순수 JSON):\n${jsonSchema}`;
 
-  const parts = [];
+  let contents;
 
   if (isVideo) {
-    // ── Step 1: Gemini File API — multipart/form-data 방식으로 업로드 ──
-    // X-Goog-Upload 헤더 방식은 400 오류 발생 → FormData 방식 사용
-    const formData = new FormData();
-    // 메타데이터 파트 (JSON)
-    formData.append(
-      "metadata",
-      new Blob([JSON.stringify({ file: { display_name: videoFile.name } })], {
-        type: "application/json",
-      })
-    );
-    // 파일 파트
-    formData.append("file", videoFile, videoFile.name);
+    // ── 비디오: SDK File API로 업로드 후 URI 참조 ──────────────────────
+    // SDK가 내부적으로 올바른 resumable upload 프로토콜을 처리해 줌
+    const uploadedFile = await ai.files.upload({
+      file: videoFile,
+      config: { mimeType: videoFile.type, displayName: videoFile.name },
+    });
 
-    const uploadRes = await fetch(
-      `https://generativelanguage.googleapis.com/upload/v1beta/files?uploadType=multipart&key=${apiKey}`,
-      { method: "POST", body: formData }
-    );
-
-    if (!uploadRes.ok) {
-      const err = await uploadRes.json().catch(() => ({}));
-      throw new Error(`파일 업로드 실패 (${uploadRes.status}): ${err?.error?.message || uploadRes.statusText}`);
+    // 비디오는 처리 완료까지 대기 (PROCESSING → ACTIVE)
+    let fileInfo = await ai.files.get({ name: uploadedFile.name });
+    let waitCount = 0;
+    while (fileInfo.state === "PROCESSING" && waitCount < 12) {
+      await new Promise((r) => setTimeout(r, 5000)); // 5초 대기
+      fileInfo = await ai.files.get({ name: uploadedFile.name });
+      waitCount++;
+    }
+    if (fileInfo.state === "FAILED") {
+      throw new Error("비디오 처리에 실패했습니다. 다른 파일을 시도해주세요.");
     }
 
-    const uploadData = await uploadRes.json();
-    const fileUri = uploadData?.file?.uri;
-    if (!fileUri) throw new Error("파일 URI를 받지 못했습니다.");
-
-    // ── Step 2: 업로드된 파일 URI로 분석 요청 ──────────────────────────
-    parts.push({ file_data: { mime_type: videoFile.type, file_uri: fileUri } });
-    parts.push({ text: `${basePrompt}\n\n이 클라리넷 연주 영상을 분석해주세요. 음정 정확도, 박자/리듬감, 음색, 셈여림, 연주 곡명을 평가해주세요.` });
+    contents = [
+      { fileData: { mimeType: videoFile.type, fileUri: fileInfo.uri } },
+      { text: `${basePrompt}\n\n이 클라리넷 연주 영상을 분석해주세요.` },
+    ];
 
   } else if (isImage) {
-    // 이미지는 inline base64로 전송 (용량 작으므로 OK)
+    // ── 이미지: inline base64 직접 전송 ────────────────────────────────
     const b64 = await fileToBase64(videoFile);
-    parts.push({ inline_data: { mime_type: videoFile.type, data: b64 } });
-    parts.push({ text: `${basePrompt}\n\n이 이미지를 바탕으로 클라리넷 연주자에게 피드백을 주세요.` });
+    contents = [
+      { inlineData: { mimeType: videoFile.type, data: b64 } },
+      { text: `${basePrompt}\n\n이 이미지를 바탕으로 클라리넷 연주자에게 피드백을 주세요.` },
+    ];
 
   } else {
-    // 파일 없음 — 텍스트 기반 일반 피드백
-    parts.push({ text: `${basePrompt}\n\n클라리넷 연주자를 위한 일반적인 피드백을 생성해주세요.` });
+    // ── 텍스트 전용 ─────────────────────────────────────────────────────
+    contents = [{ text: `${basePrompt}\n\n클라리넷 연주자를 위한 일반적인 피드백을 생성해주세요.` }];
   }
 
-  // ── Gemini 2.0 Flash 분석 요청 ──────────────────────────────────────
-  const model = "gemini-2.0-flash";
-  const url = `${GEMINI_API_BASE}/${model}:generateContent?key=${apiKey}`;
-
-  const response = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      contents: [{ role: "user", parts }],
-      generationConfig: {
-        temperature: 0.7,
-        maxOutputTokens: 1024,
-        responseMimeType: "application/json",
-      },
-    }),
+  // ── Gemini 2.0 Flash로 분석 요청 ────────────────────────────────────
+  const response = await ai.models.generateContent({
+    model: "gemini-2.0-flash",
+    contents: [{ role: "user", parts: contents }],
+    config: {
+      temperature: 0.7,
+      maxOutputTokens: 1024,
+      responseMimeType: "application/json",
+    },
   });
 
-  if (!response.ok) {
-    const errData = await response.json().catch(() => ({}));
-    const msg = errData?.error?.message || response.statusText;
-    throw new Error(`Gemini API 오류 (${response.status}): ${msg}`);
-  }
-
-  const data = await response.json();
-  const rawText = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+  const rawText = response.text ?? "";
   const cleaned = rawText.replace(/```json\s*/gi, "").replace(/```\s*/gi, "").trim();
   return JSON.parse(cleaned);
 };
