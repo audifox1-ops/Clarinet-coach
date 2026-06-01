@@ -160,20 +160,22 @@ const analyzePerformance = async (videoFile, age, gender, apiKey) => {
   const parts = [];
 
   if (isVideo) {
-    // ── Step 1: Gemini File API로 비디오 업로드 ──────────────────────────
-    // 큰 파일을 inline base64로 보내면 400 오류 → File API 사용 필수
+    // ── Step 1: Gemini File API — multipart/form-data 방식으로 업로드 ──
+    // X-Goog-Upload 헤더 방식은 400 오류 발생 → FormData 방식 사용
+    const formData = new FormData();
+    // 메타데이터 파트 (JSON)
+    formData.append(
+      "metadata",
+      new Blob([JSON.stringify({ file: { display_name: videoFile.name } })], {
+        type: "application/json",
+      })
+    );
+    // 파일 파트
+    formData.append("file", videoFile, videoFile.name);
+
     const uploadRes = await fetch(
-      `https://generativelanguage.googleapis.com/upload/v1beta/files?key=${apiKey}`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-Goog-Upload-Command": "start, upload, finalize",
-          "X-Goog-Upload-Header-Content-Length": videoFile.size,
-          "X-Goog-Upload-Header-Content-Type": videoFile.type,
-        },
-        body: videoFile,
-      }
+      `https://generativelanguage.googleapis.com/upload/v1beta/files?uploadType=multipart&key=${apiKey}`,
+      { method: "POST", body: formData }
     );
 
     if (!uploadRes.ok) {
