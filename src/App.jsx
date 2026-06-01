@@ -129,27 +129,21 @@ const fileToBase64 = (file) =>
 // ────────────────────────────────────────────────────────────────────────────────
 
 /**
- * Google Gemini API로 클라리넷 연주를 직접 분석한다
- * - 비디오/이미지: gemini-2.0-flash (멀티모달 인라인 base64)
- * - JSON 모드(responseMimeType) 활용으로 파싱 안정성 확보
+ * Google Gemini API로 클라리넷 연주를 분석한다
+ *
+ * 비디오 처리 전략:
+ *  1) 비디오 → Gemini File API로 먼저 업로드 → URI 참조로 분석 요청
+ *  2) 이미지 → inline base64로 직접 전송
+ *  3) 파일 없음 → 텍스트 프롬프트만 전송
+ *
+ * 400 오류 방지: 비디오 inline_data 직접 전송 대신 File API URI 사용
  */
 const analyzePerformance = async (videoFile, age, gender, apiKey) => {
   const personaPrompt = buildPersonaPrompt(age, gender);
-
-  // 파일 타입 확인
   const isVideo = videoFile.type.startsWith("video/");
   const isImage = videoFile.type.startsWith("image/");
 
-  // Gemini API parts 배열 구성
-  const parts = [];
-
-  // 미디어 파트 추가 (비디오 또는 이미지)
-  if (isVideo || isImage) {
-    const b64 = await fileToBase64(videoFile);
-    parts.push({ inline_data: { mime_type: videoFile.type, data: b64 } });
-  }
-
-  // 페르소나 + JSON 스키마 통합 프롬프트
+  // JSON 응답 스키마
   const jsonSchema = `{
   "detectedSong": "감지된 곡명 (모르면 '곡명 미상')",
   "scores": { "intonation": 0-100, "rhythm": 0-100, "tone": 0-100, "dynamics": 0-100 },
@@ -161,15 +155,52 @@ const analyzePerformance = async (videoFile, age, gender, apiKey) => {
   "encouragement": "격려 메시지 1문장"
 }`;
 
-  const textPrompt = isVideo
-    ? `${personaPrompt}\n\n이 클라리넷 연주 영상을 분석해주세요. 음정 정확도, 박자/리듬감, 음색, 셈여림(다이나믹), 연주 곡명을 평가하고 반드시 아래 JSON 형식으로만 응답하세요 (코드블록 없이 순수 JSON):\n${jsonSchema}`
-    : isImage
-    ? `${personaPrompt}\n\n이 이미지를 바탕으로 클라리넷 연주자에게 피드백을 주세요. 반드시 아래 JSON 형식으로만 응답하세요:\n${jsonSchema}`
-    : `${personaPrompt}\n\n클라리넷 연주자를 위한 피드백을 생성해주세요. 반드시 아래 JSON 형식으로만 응답하세요:\n${jsonSchema}`;
+  const basePrompt = `${personaPrompt}\n\n반드시 아래 JSON 형식으로만 응답하세요 (코드블록 없이 순수 JSON):\n${jsonSchema}`;
 
-  parts.push({ text: textPrompt });
+  const parts = [];
 
-  // Gemini 2.0 Flash — 멀티모달 + JSON 모드
+  if (isVideo) {
+    // ── Step 1: Gemini File API로 비디오 업로드 ──────────────────────────
+    // 큰 파일을 inline base64로 보내면 400 오류 → File API 사용 필수
+    const uploadRes = await fetch(
+      `https://generativelanguage.googleapis.com/upload/v1beta/files?key=${apiKey}`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Goog-Upload-Command": "start, upload, finalize",
+          "X-Goog-Upload-Header-Content-Length": videoFile.size,
+          "X-Goog-Upload-Header-Content-Type": videoFile.type,
+        },
+        body: videoFile,
+      }
+    );
+
+    if (!uploadRes.ok) {
+      const err = await uploadRes.json().catch(() => ({}));
+      throw new Error(`파일 업로드 실패 (${uploadRes.status}): ${err?.error?.message || uploadRes.statusText}`);
+    }
+
+    const uploadData = await uploadRes.json();
+    const fileUri = uploadData?.file?.uri;
+    if (!fileUri) throw new Error("파일 URI를 받지 못했습니다.");
+
+    // ── Step 2: 업로드된 파일 URI로 분석 요청 ──────────────────────────
+    parts.push({ file_data: { mime_type: videoFile.type, file_uri: fileUri } });
+    parts.push({ text: `${basePrompt}\n\n이 클라리넷 연주 영상을 분석해주세요. 음정 정확도, 박자/리듬감, 음색, 셈여림, 연주 곡명을 평가해주세요.` });
+
+  } else if (isImage) {
+    // 이미지는 inline base64로 전송 (용량 작으므로 OK)
+    const b64 = await fileToBase64(videoFile);
+    parts.push({ inline_data: { mime_type: videoFile.type, data: b64 } });
+    parts.push({ text: `${basePrompt}\n\n이 이미지를 바탕으로 클라리넷 연주자에게 피드백을 주세요.` });
+
+  } else {
+    // 파일 없음 — 텍스트 기반 일반 피드백
+    parts.push({ text: `${basePrompt}\n\n클라리넷 연주자를 위한 일반적인 피드백을 생성해주세요.` });
+  }
+
+  // ── Gemini 2.0 Flash 분석 요청 ──────────────────────────────────────
   const model = "gemini-2.0-flash";
   const url = `${GEMINI_API_BASE}/${model}:generateContent?key=${apiKey}`;
 
@@ -193,8 +224,6 @@ const analyzePerformance = async (videoFile, age, gender, apiKey) => {
   }
 
   const data = await response.json();
-
-  // Gemini 응답: candidates[0].content.parts[0].text
   const rawText = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
   const cleaned = rawText.replace(/```json\s*/gi, "").replace(/```\s*/gi, "").trim();
   return JSON.parse(cleaned);
